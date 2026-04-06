@@ -1,0 +1,6 @@
+requests
+pyautogui
+Pillow
+python-dotenv
+mss
+opencv-python
