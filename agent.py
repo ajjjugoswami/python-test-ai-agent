@@ -21,6 +21,46 @@ POLL_INTERVAL = 3
 AGENT_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.agent_data')
 os.makedirs(AGENT_DATA_DIR, exist_ok=True)
 
+pending_sensitive_action = None
+
+CONFIRM_POSITIVE = re.compile(r'^(?:yes|y|sure|ok|okay|confirm|go ahead|please do it|send it|do it)\b', re.I)
+CONFIRM_NEGATIVE = re.compile(r'^(?:no|n|cancel|stop|don\'t|do not|never|not now)\b', re.I)
+
+
+def is_positive_confirmation(text):
+    return bool(CONFIRM_POSITIVE.search(str(text).strip()))
+
+
+def is_negative_confirmation(text):
+    return bool(CONFIRM_NEGATIVE.search(str(text).strip()))
+
+
+def is_sensitive_action(data):
+    if not isinstance(data, dict):
+        return False
+    action = data.get('action', '')
+    if action in ('send_email', 'draft_email'):
+        return True
+    if action == 'execute':
+        cmd = str(data.get('command', '')).lower()
+        return bool(re.search(r'\b(del|erase|remove|rmdir|rd)\b', cmd))
+    return False
+
+
+def build_confirmation_text(data):
+    action = data.get('action', '')
+    if action == 'send_email':
+        to = data.get('to', 'the recipient')
+        subject = data.get('subject', '')
+        return f'I can send an email to {to}{" with subject " + subject if subject else ""}. Please confirm before I proceed.'
+    if action == 'draft_email':
+        to = data.get('to', 'the recipient')
+        return f'I can draft an email to {to}. Please confirm before I proceed.'
+    if action == 'execute':
+        cmd = data.get('command', '')
+        return f'I am ready to run this command: {cmd}. This may be destructive. Please confirm before I proceed.'
+    return 'I found a sensitive action. Please confirm before I proceed.'
+
 # ──────────────────────────────────────────────
 # Conversation Memory — persists chat history
 # ──────────────────────────────────────────────
@@ -954,6 +994,8 @@ def handle_open_app(app_name):
 
 def handle_ai(payload):
     """Smart AI handler with conversation context, memory, learning, and suggestions."""
+    global pending_sensitive_action
+
     # Track user interaction
     profile.track_command(payload)
     memory.add('user', payload)
@@ -967,6 +1009,27 @@ def handle_ai(payload):
         google_connected = gdata.get('connected', False)
     except:
         pass
+
+    # If the user is confirming a pending sensitive action, execute or cancel it.
+    if pending_sensitive_action is not None:
+        if is_positive_confirmation(payload):
+            action_data = pending_sensitive_action
+            pending_sensitive_action = None
+            output = _execute_ai_action(action_data, google_connected=google_connected)
+            return json.dumps({
+                'text': f'Confirmed. {output}',
+                'suggestions': ['What else can I do?', 'Show me my inbox']
+            })
+        if is_negative_confirmation(payload):
+            pending_sensitive_action = None
+            return json.dumps({
+                'text': 'Okay, I canceled that request. Let me know if you want to try something else.',
+                'suggestions': ['What can you do?', 'Show me my inbox']
+            })
+        return json.dumps({
+            'text': 'Please reply yes to confirm or no to cancel the pending action.',
+            'suggestions': ['Yes, proceed', 'No, cancel']
+        })
 
     profile_summary = profile.get_profile_summary()
     chat_summary = memory.get_summary_context()
@@ -1053,6 +1116,7 @@ IMPORTANT:
 - For "open X in VS Code" ALWAYS use: code "full\\path"
 - For GUI apps use the direct executable name, NOT 'start' unless needed
 - NEVER use 'cd' then run — put the full path in the command itself
+- For any sensitive or destructive actions like sending email or deleting files, do not execute them immediately. Ask the user to confirm before proceeding.
 
 2. SEND EMAIL:
 {{"action": "send_email", "to": "...", "subject": "...", "body": "...", "message": "...", "suggestions": [...], "learned": [...]}}
@@ -1216,6 +1280,15 @@ If user says "screenshot of second monitor" or "read my other screen", set monit
     # If AI detected user's name
     if data.get('user_name'):
         profile.set_name(data['user_name'])
+
+    # If the AI wants to perform a sensitive action, ask the user to confirm first.
+    if is_sensitive_action(data):
+        pending_sensitive_action = data
+        confirm_text = build_confirmation_text(data)
+        return json.dumps({
+            'text': confirm_text,
+            'suggestions': ['Yes, proceed', 'No, cancel']
+        })
 
     # Execute the action
     action_output = _execute_ai_action(data, google_connected)
@@ -1544,10 +1617,18 @@ def _execute_ai_action(data, google_connected):
             if target_app:
                 activate_ps = f"""Add-Type -AssemblyName Microsoft.VisualBasic; $procs = Get-Process | Where-Object {{$_.MainWindowTitle -like '*{target_app}*'}}; if ($procs) {{ [Microsoft.VisualBasic.Interaction]::AppActivate($procs[0].Id); Start-Sleep -Milliseconds 500 }}"""
                 subprocess.run(['powershell', '-c', activate_ps], capture_output=True, timeout=5)
-            # Escape special SendKeys characters
-            escaped = text.replace('{', '{{').replace('}', '}}').replace('+', '{+}').replace('^', '{^}').replace('%', '{%}').replace('~', '{~}')
-            subprocess.run(['powershell', '-c', f"Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('{escaped}')"], capture_output=True, timeout=5)
-            return f'✓ Typed: {text[:80]}'
+            
+            # For long text (>100 chars), use clipboard + paste (instant)
+            if len(text) > 100:
+                escaped_text = text.replace("'", "''")
+                subprocess.run(['powershell', '-c', f"Set-Clipboard -Value '{escaped_text}'"], capture_output=True, timeout=5)
+                subprocess.run(['powershell', '-c', "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('^v')"], capture_output=True, timeout=5)
+                return f'✓ Pasted: {text[:80]}...'
+            else:
+                # For short text, use SendKeys (more reliable for special keys)
+                escaped = text.replace('{', '{{').replace('}', '}}').replace('+', '{+}').replace('^', '{^}').replace('%', '{%}').replace('~', '{~}')
+                subprocess.run(['powershell', '-c', f"Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('{escaped}')"], capture_output=True, timeout=5)
+                return f'✓ Typed: {text[:80]}'
         except Exception as e:
             return f'❌ Error: {e}'
 
