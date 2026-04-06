@@ -2,7 +2,7 @@
 
 A powerful personal AI assistant with full control over a Windows PC. Connects to a backend server and uses Groq LLM for natural language processing.
 
-## Features
+## Features  
 
 - **Natural Language Commands** - Open apps, run system commands, manage files
 - **Conversation Memory** - Learns from past interactions over time
