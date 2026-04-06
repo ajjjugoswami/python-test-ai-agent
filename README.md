@@ -1,4 +1,4 @@
-# AI Python Agent (JARVIS)
+# AI Python Agent (IGRIS)
 
 A powerful personal AI assistant with full control over a Windows PC. Connects to a backend server and uses Groq LLM for natural language processing.
 
