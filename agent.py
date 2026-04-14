@@ -6,15 +6,35 @@ import subprocess
 import requests
 import re
 import threading
+import logging
 from datetime import datetime
 from urllib.parse import quote_plus
 from dotenv import load_dotenv
+from web_tester import WebTestAgent
+
+# ──────────────────────────────────────────────
+# Logging setup
+# ──────────────────────────────────────────────
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.agent_data')
+os.makedirs(LOG_DIR, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%H:%M:%S',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(os.path.join(LOG_DIR, 'agent.log'), encoding='utf-8'),
+    ]
+)
+log = logging.getLogger('jarvis')
 
 load_dotenv()
 
 BACKEND_URL = os.getenv('BACKEND_URL', 'http://localhost:3001')
 AGENT_KEY = os.getenv('AGENT_KEY', 'change-me-secret')
 GROQ_API_KEY = os.getenv('GROQ_API_KEY', '')
+GROQ_API_KEY_BACKUP = os.getenv('GROQ_API_KEY1', '')  # backup key for rate limits
 HEADERS = {'X-Agent-Key': AGENT_KEY, 'Content-Type': 'application/json'}
 POLL_INTERVAL = 3
 
@@ -65,12 +85,19 @@ def build_confirmation_text(data):
 # Conversation Memory — persists chat history
 # ──────────────────────────────────────────────
 class ConversationMemory:
-    """Stores conversation history with a rolling window. Persists to disk."""
+    """Stores conversation history with smart summarization. Old messages get
+    compressed into summaries so the agent retains long-term context without
+    blowing up the token budget."""
     FILE = os.path.join(AGENT_DATA_DIR, 'conversations.json')
-    MAX_MESSAGES = 50  # keep last N messages for context
+    SUMMARY_FILE = os.path.join(AGENT_DATA_DIR, 'conversation_summaries.json')
+    MAX_MESSAGES = 50          # keep last N raw messages
+    SUMMARY_THRESHOLD = 40     # summarize when we hit this many messages
+    SUMMARY_BATCH = 20         # how many old messages to summarize at once
+    MAX_SUMMARIES = 20         # keep last N summaries
 
     def __init__(self):
         self.messages = []
+        self.summaries = []
         self._load()
 
     def _load(self):
@@ -78,15 +105,28 @@ class ConversationMemory:
             if os.path.exists(self.FILE):
                 with open(self.FILE, 'r', encoding='utf-8') as f:
                     self.messages = json.load(f)
-                # trim old messages
                 self.messages = self.messages[-self.MAX_MESSAGES:]
         except Exception:
             self.messages = []
+        try:
+            if os.path.exists(self.SUMMARY_FILE):
+                with open(self.SUMMARY_FILE, 'r', encoding='utf-8') as f:
+                    self.summaries = json.load(f)
+                self.summaries = self.summaries[-self.MAX_SUMMARIES:]
+        except Exception:
+            self.summaries = []
 
     def _save(self):
         try:
             with open(self.FILE, 'w', encoding='utf-8') as f:
                 json.dump(self.messages[-self.MAX_MESSAGES:], f, indent=2)
+        except Exception:
+            pass
+
+    def _save_summaries(self):
+        try:
+            with open(self.SUMMARY_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self.summaries[-self.MAX_SUMMARIES:], f, indent=2)
         except Exception:
             pass
 
@@ -97,36 +137,103 @@ class ConversationMemory:
             'timestamp': datetime.now().isoformat()
         })
         self._save()
+        # Auto-summarize old messages when buffer gets large
+        if len(self.messages) >= self.SUMMARY_THRESHOLD:
+            self._auto_summarize()
 
-    def get_context(self, limit=20):
-        """Return recent messages formatted for the LLM."""
+    def _auto_summarize(self):
+        """Compress oldest messages into a summary to free up space."""
+        old_messages = self.messages[:self.SUMMARY_BATCH]
+        if not old_messages:
+            return
+        # Build a compact summary locally (no API call needed)
+        lines = []
+        for m in old_messages:
+            prefix = 'User' if m['role'] == 'user' else 'Agent'
+            text = m['content'][:100]
+            lines.append(f'{prefix}: {text}')
+        summary = {
+            'period_start': old_messages[0].get('timestamp', ''),
+            'period_end': old_messages[-1].get('timestamp', ''),
+            'message_count': len(old_messages),
+            'summary': '\n'.join(lines),
+            'created': datetime.now().isoformat()
+        }
+        self.summaries.append(summary)
+        self._save_summaries()
+        # Remove summarized messages
+        self.messages = self.messages[self.SUMMARY_BATCH:]
+        self._save()
+
+    def get_context(self, limit=15):
+        """Return recent messages formatted for the LLM, including summary context."""
+        msgs = []
+        # Inject the most recent summary as context if available
+        if self.summaries:
+            latest_summary = self.summaries[-1]
+            msgs.append({
+                'role': 'system',
+                'content': f'[Earlier conversation summary ({latest_summary["message_count"]} messages)]\n{latest_summary["summary"]}'
+            })
         recent = self.messages[-limit:]
-        return [{'role': m['role'], 'content': m['content']} for m in recent]
+        for m in recent:
+            msgs.append({'role': m['role'], 'content': m['content']})
+        return msgs
 
     def get_summary_context(self):
         """Return a compact summary of recent interactions for system prompt."""
+        parts = []
+        # Include latest summary if exists
+        if self.summaries:
+            latest = self.summaries[-1]
+            parts.append(f'[Earlier: {latest["message_count"]} messages summarized]')
+            # Show key points from summary (first 3 lines)
+            summary_lines = latest['summary'].split('\n')[:3]
+            parts.extend(summary_lines)
+            parts.append('...')
+        # Recent raw messages
         recent = self.messages[-10:]
-        if not recent:
-            return "No previous conversation."
-        lines = []
+        if not recent and not parts:
+            return 'No previous conversation.'
         for m in recent:
-            prefix = "User" if m['role'] == 'user' else "Agent"
-            # Truncate long messages
+            prefix = 'User' if m['role'] == 'user' else 'Agent'
             text = m['content'][:150] + '...' if len(m['content']) > 150 else m['content']
-            lines.append(f"{prefix}: {text}")
-        return '\n'.join(lines)
+            parts.append(f'{prefix}: {text}')
+        return '\n'.join(parts)
+
+    def search(self, query):
+        """Search conversation history for relevant context."""
+        query_lower = query.lower()
+        results = []
+        for m in reversed(self.messages):
+            if query_lower in m['content'].lower():
+                results.append(m)
+                if len(results) >= 5:
+                    break
+        return results
 
     def clear(self):
         self.messages = []
+        self.summaries = []
         self._save()
+        self._save_summaries()
 
 
 # ──────────────────────────────────────────────
 # User Profile — learns preferences over time
 # ──────────────────────────────────────────────
 class UserProfile:
-    """Tracks user patterns, preferences, and frequently used commands."""
+    """Tracks user patterns, preferences, and frequently used commands.
+    Categorizes learned facts for smarter context injection."""
     FILE = os.path.join(AGENT_DATA_DIR, 'user_profile.json')
+
+    TRACKED_KEYWORDS = [
+        'screenshot', 'email', 'open chrome', 'lock', 'volume', 'search',
+        'youtube', 'whatsapp', 'teams', 'files', 'system info', 'shutdown',
+        'restart', 'drive', 'gmail', 'vscode', 'code', 'notepad', 'camera',
+        'timer', 'wallpaper', 'weather', 'spotify', 'discord', 'zoom',
+        'project', 'git', 'npm', 'python', 'install',
+    ]
 
     def __init__(self):
         self.data = {
@@ -135,8 +242,20 @@ class UserProfile:
             'frequent_commands': {},
             'favorite_apps': [],
             'common_contacts': [],
-            'facts': [],  # things the agent learned about the user
+            'facts': [],             # legacy flat list
+            'categorized_facts': {   # organized by category
+                'identity': [],      # name, age, location
+                'work': [],          # job, company, role
+                'tech': [],          # skills, tools, languages
+                'preferences': [],   # likes, dislikes, habits
+                'schedule': [],      # routines, meetings
+                'contacts': [],      # people they mention
+                'projects': [],      # current projects / repos
+            },
             'total_interactions': 0,
+            'first_seen': '',
+            'last_seen': '',
+            'session_count': 0,
         }
         self._load()
 
@@ -145,6 +264,12 @@ class UserProfile:
             if os.path.exists(self.FILE):
                 with open(self.FILE, 'r', encoding='utf-8') as f:
                     saved = json.load(f)
+                    # Deep merge categorized_facts
+                    if 'categorized_facts' in saved:
+                        for cat, facts in saved['categorized_facts'].items():
+                            if cat in self.data['categorized_facts']:
+                                self.data['categorized_facts'][cat] = facts
+                        del saved['categorized_facts']
                     self.data.update(saved)
         except Exception:
             pass
@@ -159,42 +284,92 @@ class UserProfile:
     def track_command(self, user_input):
         """Track what commands/requests are used most."""
         self.data['total_interactions'] += 1
-        # Extract key action words
+        self.data['last_seen'] = datetime.now().isoformat()
+        if not self.data['first_seen']:
+            self.data['first_seen'] = self.data['last_seen']
         lower = user_input.strip().lower()
-        for keyword in ['screenshot', 'email', 'open chrome', 'lock', 'volume',
-                        'search', 'youtube', 'whatsapp', 'teams', 'files',
-                        'system info', 'shutdown', 'restart', 'drive', 'gmail']:
+        for keyword in self.TRACKED_KEYWORDS:
             if keyword in lower:
                 self.data['frequent_commands'][keyword] = \
                     self.data['frequent_commands'].get(keyword, 0) + 1
         self._save()
 
     def learn_from_ai(self, learned_facts):
-        """Store facts the AI learned about the user from conversation."""
-        if learned_facts and isinstance(learned_facts, list):
-            for fact in learned_facts:
-                if fact and fact not in self.data['facts']:
-                    self.data['facts'].append(fact)
-            # Keep only last 50 facts
-            self.data['facts'] = self.data['facts'][-50:]
-            self._save()
+        """Store facts the AI learned, auto-categorizing them."""
+        if not learned_facts or not isinstance(learned_facts, list):
+            return
+        for fact in learned_facts:
+            if not fact or not isinstance(fact, str):
+                continue
+            # Skip duplicates (fuzzy — check if very similar fact exists)
+            fact_lower = fact.lower().strip()
+            if any(fact_lower == f.lower().strip() for f in self.data['facts']):
+                continue
+            # Add to flat list (backward compat)
+            self.data['facts'].append(fact)
+            # Auto-categorize
+            category = self._categorize_fact(fact_lower)
+            cat_list = self.data['categorized_facts'].get(category, [])
+            if fact not in cat_list:
+                cat_list.append(fact)
+                # Keep each category manageable
+                self.data['categorized_facts'][category] = cat_list[-15:]
+        self.data['facts'] = self.data['facts'][-50:]
+        self._save()
+
+    def _categorize_fact(self, fact_lower):
+        """Auto-categorize a learned fact based on keywords."""
+        if any(w in fact_lower for w in ['name is', 'called', 'years old', 'lives in', 'from ']):
+            return 'identity'
+        if any(w in fact_lower for w in ['works', 'job', 'company', 'developer', 'engineer', 'manager', 'student']):
+            return 'work'
+        if any(w in fact_lower for w in ['uses', 'prefers', 'codes in', 'python', 'javascript', 'react', 'node']):
+            return 'tech'
+        if any(w in fact_lower for w in ['likes', 'prefers', 'favorite', 'hates', 'always', 'never', 'usually']):
+            return 'preferences'
+        if any(w in fact_lower for w in ['morning', 'evening', 'meeting', 'routine', 'schedule', 'every day']):
+            return 'schedule'
+        if any(w in fact_lower for w in ['project', 'repo', 'building', 'working on', 'app called']):
+            return 'projects'
+        if any(w in fact_lower for w in ['friend', 'colleague', 'boss', 'email to', 'message to']):
+            return 'contacts'
+        return 'preferences'  # default
 
     def set_name(self, name):
         if name and name != self.data['name']:
             self.data['name'] = name
             self._save()
 
+    def start_session(self):
+        """Call at agent startup to track sessions."""
+        self.data['session_count'] = self.data.get('session_count', 0) + 1
+        self.data['last_seen'] = datetime.now().isoformat()
+        self._save()
+
     def get_profile_summary(self):
-        """Return a compact profile for the system prompt."""
+        """Return a rich, categorized profile for the system prompt."""
         parts = []
         if self.data['name']:
-            parts.append(f"User's name: {self.data['name']}")
-        if self.data['facts']:
-            parts.append(f"Known facts: {'; '.join(self.data['facts'][-10:])}")
-        top_cmds = sorted(self.data['frequent_commands'].items(), key=lambda x: -x[1])[:5]
+            parts.append(f"Name: {self.data['name']}")
+
+        # Show categorized facts
+        cat_facts = self.data.get('categorized_facts', {})
+        for category in ['identity', 'work', 'tech', 'projects', 'preferences', 'schedule', 'contacts']:
+            facts = cat_facts.get(category, [])
+            if facts:
+                # Show last 5 per category
+                recent = facts[-5:]
+                parts.append(f"{category.title()}: {'; '.join(recent)}")
+
+        # Fallback to flat facts if no categorized facts yet
+        if not any(cat_facts.get(c) for c in cat_facts):
+            if self.data['facts']:
+                parts.append(f"Known facts: {'; '.join(self.data['facts'][-10:])}")
+
+        top_cmds = sorted(self.data['frequent_commands'].items(), key=lambda x: -x[1])[:7]
         if top_cmds:
-            parts.append(f"Most used: {', '.join(c[0] for c in top_cmds)}")
-        parts.append(f"Total interactions: {self.data['total_interactions']}")
+            parts.append(f"Most used: {', '.join(f'{c[0]}({c[1]}x)' for c in top_cmds)}")
+        parts.append(f"Sessions: {self.data.get('session_count', 0)} | Total interactions: {self.data['total_interactions']}")
         return '\n'.join(parts) if parts else 'New user, no history yet.'
 
 
@@ -203,58 +378,89 @@ memory = ConversationMemory()
 profile = UserProfile()
 
 
-def ask_groq(user_input, system_prompt=None, use_context=False):
-    """Use Groq LLaMA to process a request. Optionally includes conversation context."""
-    if not GROQ_API_KEY:
-        return None
+GROQ_MODELS = [
+    'llama-3.3-70b-versatile',   # primary — best quality
+    'llama-3.1-8b-instant',      # fallback — fast, lower quality
+]
+
+
+def _groq_request(messages, api_key, model, temperature=0.3, max_tokens=2048, timeout=20):
+    """Low-level Groq API call. Returns (response_text, error_string)."""
     try:
-        messages = []
-        if system_prompt:
-            messages.append({'role': 'system', 'content': system_prompt})
-        if use_context:
-            # Inject recent conversation history
-            messages.extend(memory.get_context(limit=15))
-        else:
-            messages.append({'role': 'user', 'content': user_input})
         resp = requests.post(
             'https://api.groq.com/openai/v1/chat/completions',
             headers={
-                'Authorization': f'Bearer {GROQ_API_KEY}',
+                'Authorization': f'Bearer {api_key}',
                 'Content-Type': 'application/json',
             },
             json={
-                'model': 'llama-3.3-70b-versatile',
+                'model': model,
                 'messages': messages,
-                'max_tokens': 2000,
+                'max_tokens': max_tokens,
+                'temperature': temperature,
             },
-            timeout=15,
+            timeout=timeout,
         )
         if resp.status_code == 429:
-            print(f'[groq] Rate limited on primary model, trying fallback...')
-            resp = requests.post(
-                'https://api.groq.com/openai/v1/chat/completions',
-                headers={
-                    'Authorization': f'Bearer {GROQ_API_KEY}',
-                    'Content-Type': 'application/json',
-                },
-                json={
-                    'model': 'llama-3.1-8b-instant',
-                    'messages': messages,
-                    'max_tokens': 2000,
-                },
-                timeout=15,
-            )
+            return None, 'rate_limited'
         if resp.status_code != 200:
-            print(f'[groq] HTTP {resp.status_code}: {resp.text[:300]}')
-            return None
+            log.warning(f'Groq HTTP {resp.status_code}: {resp.text[:300]}')
+            return None, f'http_{resp.status_code}'
         data = resp.json()
         result = data['choices'][0]['message']['content'].strip()
+        # Strip markdown code fences if present
         if result.startswith('```'):
             result = result.split('\n', 1)[-1].rsplit('```', 1)[0].strip()
-        return result
+        return result, None
+    except requests.exceptions.Timeout:
+        return None, 'timeout'
     except Exception as e:
-        print(f'[groq] error: {e}')
+        log.error(f'Groq error: {e}')
+        return None, str(e)
+
+
+def ask_groq(user_input, system_prompt=None, use_context=False, temperature=0.3, max_tokens=2048):
+    """Use Groq LLaMA to process a request with smart fallback chain:
+    1. Primary model + primary key
+    2. Primary model + backup key (if rate limited)
+    3. Fallback model + primary key
+    4. Fallback model + backup key
+    """
+    if not GROQ_API_KEY:
         return None
+
+    messages = []
+    if system_prompt:
+        messages.append({'role': 'system', 'content': system_prompt})
+    if use_context:
+        messages.extend(memory.get_context(limit=15))
+    else:
+        messages.append({'role': 'user', 'content': user_input})
+
+    # Build fallback chain: (model, api_key) pairs
+    attempts = [(GROQ_MODELS[0], GROQ_API_KEY)]
+    if GROQ_API_KEY_BACKUP:
+        attempts.append((GROQ_MODELS[0], GROQ_API_KEY_BACKUP))
+    attempts.append((GROQ_MODELS[1], GROQ_API_KEY))
+    if GROQ_API_KEY_BACKUP:
+        attempts.append((GROQ_MODELS[1], GROQ_API_KEY_BACKUP))
+
+    for model, key in attempts:
+        result, error = _groq_request(messages, key, model, temperature, max_tokens)
+        if result is not None:
+            return result
+        if error == 'rate_limited':
+            key_label = 'primary' if key == GROQ_API_KEY else 'backup'
+            log.warning(f'Rate limited on {model} ({key_label} key), trying next...')
+            continue
+        if error == 'timeout':
+            log.warning(f'Timeout on {model}, trying next...')
+            continue
+        # Other errors — still try next in chain
+        log.warning(f'Error on {model}: {error}, trying next...')
+
+    log.error('All Groq API attempts exhausted')
+    return None
 
 
 def ask_groq_command(user_input):
@@ -266,8 +472,9 @@ def ask_groq_command(user_input):
         '- Reply with ONLY the raw command, nothing else\n'
         '- No explanation, no markdown, no backticks\n'
         '- Use "start" to open apps/URLs on Windows\n'
+        '- Use double backslashes for paths\n'
         '- If already a valid command, return as-is'
-    ))
+    ), temperature=0.1, max_tokens=256)
     return cmd
 
 
@@ -371,7 +578,7 @@ def search_youtube_video_url(query):
         if video_ids:
             return f'https://www.youtube.com/watch?v={video_ids[0]}'
     except Exception as e:
-        print(f'[youtube] search error: {e}')
+        log.warning(f'YouTube search error: {e}')
     # Fallback to search results page
     return f'https://www.youtube.com/results?search_query={quote_plus(query)}'
 
@@ -509,7 +716,7 @@ def send_heartbeat():
     try:
         requests.post(f'{BACKEND_URL}/heartbeat', headers=HEADERS, timeout=5)
     except Exception as e:
-        print(f'[heartbeat] error: {e}')
+        log.debug(f'Heartbeat error: {e}')
 
 
 def post_result(command_id, output, screenshot=None):
@@ -530,7 +737,7 @@ def post_result(command_id, output, screenshot=None):
             pass
         requests.post(f'{BACKEND_URL}/result', headers=HEADERS, json=body, timeout=30)
     except Exception as e:
-        print(f'[result] error: {e}')
+        log.error(f'Result post error: {e}')
 
 
 def handle_shell(payload):
@@ -583,7 +790,7 @@ def capture_screenshot(monitor=0):
         import pyautogui
         return pyautogui.screenshot()
     except Exception as e:
-        print(f'[screenshot] error: {e}')
+        log.error(f'Screenshot error: {e}')
         import pyautogui
         return pyautogui.screenshot()
 
@@ -597,7 +804,7 @@ def handle_screenshot(monitor=0):
         img.save(buf, format='PNG')
         return base64.b64encode(buf.getvalue()).decode('utf-8')
     except Exception as e:
-        print(f'[screenshot] error: {e}')
+        log.error(f'Screenshot error: {e}')
         return None
 
 
@@ -759,7 +966,7 @@ def read_screen_with_ai(prompt="Describe everything you see on the screen in det
         result = data['choices'][0]['message']['content'].strip()
         return b64_img, result
     except Exception as e:
-        print(f'[screen-read] error: {e}')
+        log.error(f'Screen read error: {e}')
         return None, f'Error reading screen: {e}'
 
 
@@ -794,7 +1001,7 @@ def handle_screen_action(data):
             return '\n'.join(outputs)
 
     # Step 2: Wait for the page/app to load
-    print(f'[screen-action] Waiting {wait_seconds}s for screen to load...')
+    log.info(f'Screen action: waiting {wait_seconds}s for screen to load...')
     time.sleep(wait_seconds)
 
     # Step 3: Read the screen
@@ -992,6 +1199,174 @@ def handle_open_app(app_name):
         return f'Error: {e}'
 
 
+def build_system_prompt(profile_summary, google_connected, google_email, chat_summary):
+    """Build a modular, well-structured system prompt for the AI agent."""
+
+    google_status = f'Connected ({google_email})' if google_connected else 'Not connected'
+
+    return f'''You are JARVIS — an elite, personal AI assistant with FULL control over a Windows 11 PC.
+You are not a chatbot. You are an intelligent agent that THINKS before acting, remembers context,
+learns from every interaction, and proactively helps the user get things done.
+
+═══ IDENTITY & PERSONALITY ═══
+- You are confident, resourceful, and slightly witty — like a smart friend who happens to control a PC.
+- Be concise. No walls of text. 1-2 sentence messages unless the user asks for detail.
+- Use the user's name when you know it. Remember their preferences.
+- If you made a mistake before, own it briefly and fix it — don't over-apologize.
+- When the user is vague ("do that thing", "open it"), use conversation history to infer what they mean.
+- Be proactive: if opening VS Code, suggest relevant recent projects. If checking email, mention unread count.
+
+═══ USER PROFILE ═══
+{profile_summary}
+Google: {google_status}
+
+═══ RECENT CONVERSATION ═══
+{chat_summary}
+
+═══ THINKING PROCESS ═══
+Before responding, mentally:
+1. What is the user actually trying to accomplish? (not just what they literally said)
+2. Do I have enough context from conversation history? Check for "it", "that", "same", "again" references.
+3. Which action type best fits? Prefer specific actions over generic "execute".
+4. Is this sensitive/destructive? If so, confirm first.
+5. What would be a useful follow-up suggestion?
+
+═══ RESPONSE FORMAT ═══
+RESPOND WITH ONLY A JSON OBJECT. No text before or after. No markdown wrapping.
+
+{{
+  "action": "<action_type>",
+  ... action-specific fields ...,
+  "message": "Short, natural response to show the user",
+  "suggestions": ["suggestion 1", "suggestion 2", "suggestion 3"],
+  "learned": ["any new fact about the user — name, job, preference, etc."]
+}}
+
+═══ ACTIONS REFERENCE ═══
+
+EXECUTE — Run any Windows command:
+{{"action": "execute", "command": "<cmd>", "message": "...", "suggestions": [...], "learned": [...]}}
+
+Key commands to know:
+  Apps:       start chrome | start firefox | start msedge | code "path" | start notepad | start calc
+  System:     shutdown /s /t 60 | shutdown /r /t 60 | shutdown /a | rundll32.exe user32.dll,LockWorkStation
+  Files:      dir "path" | mkdir "path" | del "path" | copy "src" "dst" | move "src" "dst" | type "path"
+  Info:       systeminfo | ipconfig | tasklist | hostname | wmic logicaldisk get size,freespace,caption
+  Volume:     powershell -Command "(New-Object -ComObject WScript.Shell).SendKeys([char]173)" (173=mute, 175=up, 174=down)
+  Clipboard:  powershell -Command "Get-Clipboard" | powershell -Command "Set-Clipboard -Value 'text'"
+  Settings:   start ms-settings: | start ms-settings:bluetooth | start ms-settings:network-wifi
+  Folders:    explorer shell:Downloads | explorer shell:Documents | explorer shell:Desktop
+  URLs:       start chrome "https://example.com"
+  Kill:       taskkill /IM app.exe /F
+  Write file: powershell -Command "Set-Content -Path 'path' -Value 'content'"
+  Date:       powershell -Command "Get-Date"
+
+Rules: Use \\\\ in JSON paths. Quote paths with spaces. Full paths always (no cd). Use "start" for GUI apps.
+
+ANSWER — For conversation, questions, knowledge:
+{{"action": "answer", "response": "...", "suggestions": [...], "learned": [...]}}
+
+MULTI-STEP — Chain sequential actions (MANDATORY for open+write, open+type tasks):
+{{"action": "multi", "steps": [{{action1}}, {{action2}}, ...], "message": "...", "suggestions": [...], "learned": [...]}}
+Each step is a full action object. Steps run sequentially with automatic delays between GUI launches.
+
+*** MANDATORY MULTI EXAMPLE — "open notepad and write X": ***
+{{"action": "multi", "steps": [
+  {{"action": "execute", "command": "start notepad"}},
+  {{"action": "type_text", "text": "the full text content here", "app": "Notepad"}}
+], "message": "Opened Notepad and wrote the content!", "suggestions": [...], "learned": []}}
+
+You MUST use "multi" with BOTH an "execute" step AND a "type_text" step when the user says:
+- "open notepad and write/type X"
+- "open notepad and write a song/poem/letter"
+- "launch notepad and put X in it"
+A single "execute" action CANNOT type text. You MUST include a separate "type_text" step with the ACTUAL content.
+
+YOUTUBE PLAY — Play a song/video (searches and opens first result):
+{{"action": "youtube_play", "query": "song name", "message": "...", "suggestions": [...], "learned": [...]}}
+IMPORTANT: "play X", "play X on youtube" → ALWAYS use youtube_play, never execute with search URL.
+
+EMAIL — Send or draft:
+{{"action": "send_email", "to": "...", "subject": "...", "body": "...", "message": "...", "suggestions": [...], "learned": [...]}}
+{{"action": "draft_email", "to": "...", "subject": "...", "body": "...", "message": "...", "suggestions": [...], "learned": [...]}}
+Write complete emails with greeting and sign-off. NEVER use mailto or outlook — always use these actions.
+
+GOOGLE — Drive and Gmail:
+{{"action": "google_drive", "query": "...", "message": "...", "suggestions": [...], "learned": [...]}}
+{{"action": "gmail_inbox", "message": "...", "suggestions": [...], "learned": [...]}}
+
+SCREEN — Vision capabilities:
+{{"action": "screen_read", "prompt": "what to look for", "message": "...", "suggestions": [...], "learned": [...]}}
+{{"action": "screen_action", "command": "start chrome \\"url\\"", "wait": 6, "read_prompt": "what to extract", "message": "...", "suggestions": [...], "learned": [...]}}
+User has MULTIPLE MONITORS: monitor=0 (all), monitor=1 (main), monitor=2 (second), etc.
+
+CAMERA:
+{{"action": "camera_photo", "message": "...", "suggestions": [...], "learned": [...]}}
+{{"action": "camera_stream", "duration": 10, "message": "...", "suggestions": [...], "learned": [...]}}
+{{"action": "camera_video", "duration": 10, "message": "...", "suggestions": [...], "learned": [...]}}
+
+FILE OPERATIONS:
+{{"action": "write_file", "path": "D:\\\\path\\\\file.txt", "content": "...", "message": "...", "suggestions": [...], "learned": [...]}}
+{{"action": "append_file", "path": "D:\\\\path\\\\file.txt", "content": "...", "message": "...", "suggestions": [...], "learned": [...]}}
+{{"action": "read_file", "path": "D:\\\\path\\\\file.txt", "message": "...", "suggestions": [...], "learned": [...]}}
+{{"action": "edit_file", "path": "D:\\\\path\\\\file.txt", "find": "old", "replace": "new", "message": "...", "suggestions": [...], "learned": [...]}}
+{{"action": "browse_folder", "path": "D:\\\\path", "message": "...", "suggestions": [...], "learned": [...]}}
+
+CREATE PROJECT — Scaffold entire projects with files + commands:
+{{"action": "create_project", "path": "D:\\\\Users\\\\user\\\\project", "steps": [
+  {{"type": "file", "path": "index.html", "content": "<!DOCTYPE html>..."}},
+  {{"type": "command", "command": "npm install"}}
+], "message": "...", "suggestions": [...], "learned": [...]}}
+Write COMPLETE, WORKING, PRODUCTION-READY code. Never placeholders.
+
+UI & INPUT:
+{{"action": "type_text", "text": "...", "app": "Notepad", "message": "...", "suggestions": [...], "learned": [...]}}
+{{"action": "hotkey", "keys": "^s", "message": "...", "suggestions": [...], "learned": [...]}}
+  Key codes: ^ = Ctrl, % = Alt, + = Shift. Ex: ^s = Ctrl+S, %{{F4}} = Alt+F4
+{{"action": "clipboard_get", "message": "...", "suggestions": [...], "learned": [...]}}
+{{"action": "clipboard_set", "text": "...", "message": "...", "suggestions": [...], "learned": [...]}}
+
+SYSTEM:
+{{"action": "notify", "title": "...", "text": "...", "message": "...", "suggestions": [...], "learned": [...]}}
+{{"action": "set_wallpaper", "path": "D:\\\\path\\\\img.jpg", "message": "...", "suggestions": [...], "learned": [...]}}
+{{"action": "window_manage", "operation": "minimize_all|restore_all|close_app|list_windows", "app": "app.exe", "message": "...", "suggestions": [...], "learned": [...]}}
+{{"action": "set_timer", "seconds": 300, "label": "Break", "message": "...", "suggestions": [...], "learned": [...]}}
+{{"action": "search_files", "query": "resume", "folder": "D:\\\\Users", "message": "...", "suggestions": [...], "learned": [...]}}
+{{"action": "installed_apps", "message": "...", "suggestions": [...], "learned": [...]}}
+
+WEB SEARCH — Search the web and return results:
+{{"action": "web_search", "query": "search terms", "message": "...", "suggestions": [...], "learned": [...]}}
+Use for: current events, weather, facts, prices, anything requiring up-to-date info.
+
+WEB TEST — Autonomous website testing (signup, onboarding, bug finding):
+{{"action": "web_test", "url": "https://example.com", "instructions": "optional specific test instructions", "message": "...", "suggestions": [...], "learned": [...]}}
+Use when user says: "test this website", "find bugs on", "try signing up on", "test the onboarding", etc.
+The agent will auto-create a temp email, sign up, go through onboarding, and report all bugs found.
+
+SYSTEM HEALTH — Get a full system health report:
+{{"action": "system_health", "message": "...", "suggestions": [...], "learned": [...]}}
+Use for: "how's my PC", "system status", "check my computer", "diagnostics"
+
+═══ CRITICAL RULES ═══
+1. ALWAYS respond with valid JSON. Never plain text. Never markdown-wrapped.
+2. "message" — short, natural, friendly. Use user's name if known.
+3. "suggestions" — ALWAYS include 2-3 smart follow-ups. Complete sentences the user can tap.
+4. "learned" — extract facts (name, job, preferences, schedule). Empty array [] if nothing new.
+5. CONVERSATION CONTEXT — "do that again", "same thing", "that folder" → check history.
+6. SENSITIVE ACTIONS — email sending, file deletion → these are handled automatically, just emit the action.
+7. CODING — you ARE a full-stack developer. Write COMPLETE code. Use write_file, edit_file, create_project.
+8. COMPLEX TASKS — use "multi" to chain steps. You are not limited to one action per turn.
+9. You can run ANY Windows command, write ANY file, create ENTIRE projects. Use your full power.
+10. When user asks to "open" something — figure out the right command. Don't be limited by examples.
+
+═══ COMMON MISTAKES TO AVOID ═══
+!! NEVER say you typed/wrote something in the "message" field without ACTUALLY including a type_text action.
+!! "open notepad and write X" → MUST be "multi" with execute + type_text. NOT just execute alone.
+!! "execute" action can ONLY run commands. It CANNOT type text into windows. Use "type_text" for that.
+!! If the user asks you to write content somewhere, the ACTUAL TEXT must appear in a type_text or write_file action.
+!! Do NOT fabricate results. If you only opened notepad, say "Opened Notepad" — don't claim you wrote lyrics.'''
+
+
 def handle_ai(payload):
     """Smart AI handler with conversation context, memory, learning, and suggestions."""
     global pending_sensitive_action
@@ -1034,214 +1409,7 @@ def handle_ai(payload):
     profile_summary = profile.get_profile_summary()
     chat_summary = memory.get_summary_context()
 
-    system_prompt = f'''You are JARVIS — a powerful, personal AI assistant with FULL control over a Windows 11 PC.
-You have memory of past conversations and you learn from the user over time.
-
-═══ USER PROFILE ═══
-{profile_summary}
-Google: {"Connected (" + google_email + ")" if google_connected else "Not connected"}
-
-═══ RECENT CONVERSATION ═══
-{chat_summary}
-
-═══ RESPONSE FORMAT ═══
-RESPOND WITH ONLY A JSON OBJECT. No text before or after.
-
-{{
-  "action": "<action_type>",
-  ... action-specific fields ...,
-  "message": "A friendly, conversational response to show the user",
-  "suggestions": ["suggestion 1", "suggestion 2", "suggestion 3"],
-  "learned": ["any new fact learned about the user from this conversation"]
-}}
-
-═══ ACTION TYPES ═══
-
-1. EXECUTE — Run a command:
-{{"action": "execute", "command": "...", "message": "...", "suggestions": [...], "learned": [...]}}
-
-CRITICAL COMMAND KNOWLEDGE (use exactly these):
-- Open folder in VS Code: code "D:\\path\\to\\folder"
-- Open file in VS Code: code "D:\\path\\to\\file.txt"
-- Open VS Code: code .
-- Open folder in Explorer: explorer "D:\\path\\to\\folder"
-- Open Chrome: start chrome
-- Open URL: start chrome "https://example.com"
-- Open any app: start appname
-- Open specific file: start "" "D:\\path\\to\\file.docx"
-- Close app: taskkill /IM chrome.exe /F
-- Lock PC: rundll32.exe user32.dll,LockWorkStation
-- Shutdown: shutdown /s /t 60
-- Restart: shutdown /r /t 60
-- Cancel shutdown: shutdown /a
-- Sleep: rundll32.exe powrprof.dll,SetSuspendState 0,1,0
-- Volume mute: powershell -Command "(New-Object -ComObject WScript.Shell).SendKeys([char]173)"
-- Volume up: powershell -Command "(New-Object -ComObject WScript.Shell).SendKeys([char]175)"
-- Volume down: powershell -Command "(New-Object -ComObject WScript.Shell).SendKeys([char]174)"
-- List files: dir "D:\\path"
-- Create folder: mkdir "D:\\path\\newfolder"
-- Delete file: del "D:\\path\\file.txt"
-- Copy file: copy "D:\\src" "D:\\dst"
-- Move file: move "D:\\src" "D:\\dst"
-- Read file content: type "D:\\path\\file.txt"
-- Write to file: powershell -Command "Set-Content -Path 'D:\\path\\file.txt' -Value 'content'"
-- System info: systeminfo
-- IP address: ipconfig
-- WiFi info: netsh wlan show interfaces
-- Disk space: wmic logicaldisk get size,freespace,caption
-- Running processes: tasklist
-- Clipboard: powershell -Command "Get-Clipboard"
-- Set clipboard: powershell -Command "Set-Clipboard -Value 'text'"
-- WhatsApp message: start chrome "https://web.whatsapp.com/send?phone=NUMBER&text=MESSAGE"
-- Search Google: start chrome "https://www.google.com/search?q=QUERY"
-- YouTube search: start chrome "https://www.youtube.com/results?search_query=QUERY"
-- YouTube PLAY a song/video: USE ACTION "youtube_play" with the song/video name — this finds and plays the first result directly!
-  IMPORTANT: When user says "play X", "play X on youtube", "open X song" — ALWAYS use youtube_play action, NOT execute with a search URL.
-- Type text into active window: powershell -Command "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('text')"
-- Open Task Manager: start taskmgr
-- Open Settings: start ms-settings:
-- Open Downloads: explorer shell:Downloads
-- Open Documents: explorer shell:Documents
-- Open Desktop: explorer shell:Desktop
-- Open Bluetooth settings: start ms-settings:bluetooth
-- Open WiFi settings: start ms-settings:network-wifi
-- Date/time: powershell -Command "Get-Date"
-- Uptime: powershell -Command "(Get-Date) - (Get-CimInstance Win32_OperatingSystem).LastBootUpTime"
-- Installed apps: powershell -Command "Get-ItemProperty HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\* | Select DisplayName, DisplayVersion | Format-Table -AutoSize"
-- Kill by window title: powershell -Command "Get-Process | Where-Object {{$_.MainWindowTitle -like '*keyword*'}} | Stop-Process -Force"
-
-IMPORTANT:
-- Use DOUBLE BACKSLASHES in JSON paths: D:\\\\Users\\\\...
-- Always quote paths with spaces
-- For "open X in VS Code" ALWAYS use: code "full\\path"
-- For GUI apps use the direct executable name, NOT 'start' unless needed
-- NEVER use 'cd' then run — put the full path in the command itself
-- For any sensitive or destructive actions like sending email or deleting files, do not execute them immediately. Ask the user to confirm before proceeding.
-
-2. SEND EMAIL:
-{{"action": "send_email", "to": "...", "subject": "...", "body": "...", "message": "...", "suggestions": [...], "learned": [...]}}
-- Compose complete, well-written emails with greeting and sign-off
-
-3. DRAFT EMAIL:
-{{"action": "draft_email", "to": "...", "subject": "...", "body": "...", "message": "...", "suggestions": [...], "learned": [...]}}
-
-4. GOOGLE DRIVE:
-{{"action": "google_drive", "query": "...", "message": "...", "suggestions": [...], "learned": [...]}}
-
-5. GMAIL INBOX:
-{{"action": "gmail_inbox", "message": "...", "suggestions": [...], "learned": [...]}}
-
-6. ANSWER/CHAT — For questions, conversation, help:
-{{"action": "answer", "response": "...", "suggestions": [...], "learned": [...]}}
-
-7. MULTI-STEP — Complex tasks needing sequential steps:
-{{"action": "multi", "steps": [...], "message": "...", "suggestions": [...], "learned": [...]}}
-Each step is its own action object. Steps run sequentially. Use this for complex tasks like "create a project and open it in VS Code".
-
-8. YOUTUBE PLAY — Play a song/video directly on YouTube:
-{{"action": "youtube_play", "query": "song or video name", "message": "...", "suggestions": [...], "learned": [...]}}
-
-9. SCREEN READ — Read/analyze what's currently on screen:
-{{"action": "screen_read", "prompt": "what to look for on screen", "message": "...", "suggestions": [...], "learned": [...]}}
-
-10. SCREEN ACTION — Open something, wait for it to load, then read the screen:
-{{"action": "screen_action", "command": "start chrome \\"https://vercel.com/dashboard\\"", "wait": 6, "read_prompt": "List all project names and their status visible on this dashboard", "message": "...", "suggestions": [...], "learned": [...]}}
-
-11. CAMERA PHOTO — Take a photo from webcam:
-{{"action": "camera_photo", "message": "...", "suggestions": [...], "learned": [...]}}
-
-12. CAMERA STREAM — Capture live frames from webcam for N seconds:
-{{"action": "camera_stream", "duration": 10, "message": "...", "suggestions": [...], "learned": [...]}}
-
-13. CAMERA VIDEO — Record a video from webcam:
-{{"action": "camera_video", "duration": 10, "message": "...", "suggestions": [...], "learned": [...]}}
-
-14. WRITE FILE — Create or overwrite a file with content:
-{{"action": "write_file", "path": "D:\\\\path\\\\file.txt", "content": "file content here", "message": "...", "suggestions": [...], "learned": [...]}}
-Use for: creating scripts, code files, config files, notes, HTML pages, etc.
-
-15. APPEND FILE — Add content to end of existing file:
-{{"action": "append_file", "path": "D:\\\\path\\\\file.txt", "content": "content to add", "message": "...", "suggestions": [...], "learned": [...]}}
-
-16. READ FILE — Read and return file contents:
-{{"action": "read_file", "path": "D:\\\\path\\\\file.txt", "message": "...", "suggestions": [...], "learned": [...]}}
-Use when user says "read this file", "show me the code in...", "what's in this file"
-
-17. EDIT FILE — Find and replace text in a file:
-{{"action": "edit_file", "path": "D:\\\\path\\\\file.txt", "find": "old text", "replace": "new text", "message": "...", "suggestions": [...], "learned": [...]}}
-Use for: fixing bugs, updating code, changing config values.
-
-18. BROWSE FOLDER — List contents of a folder with sizes:
-{{"action": "browse_folder", "path": "D:\\\\path\\\\folder", "message": "...", "suggestions": [...], "learned": [...]}}
-Use when user says "show me what's in this folder", "list my projects", "what files are on desktop"
-
-19. CREATE PROJECT — Scaffold an entire project with multiple files + commands:
-{{"action": "create_project", "path": "D:\\\\Users\\\\username\\\\project-name", "steps": [
-  {{"type": "file", "path": "index.html", "content": "<!DOCTYPE html>..."}},
-  {{"type": "file", "path": "style.css", "content": "body {{ ... }}"}},
-  {{"type": "file", "path": "package.json", "content": "{{...}}"}},
-  {{"type": "command", "command": "npm install"}},
-  {{"type": "command", "command": "git init"}}
-], "message": "...", "suggestions": [...], "learned": [...]}}
-YOU ARE A FULL-STACK DEVELOPER. Write COMPLETE, WORKING code. Not placeholders.
-
-20. CLIPBOARD GET — Read current clipboard content:
-{{"action": "clipboard_get", "message": "...", "suggestions": [...], "learned": [...]}}
-
-21. CLIPBOARD SET — Copy text to clipboard:
-{{"action": "clipboard_set", "text": "content to copy", "message": "...", "suggestions": [...], "learned": [...]}}
-
-22. DESKTOP NOTIFICATION — Show a Windows toast notification:
-{{"action": "notify", "title": "Reminder", "text": "Meeting in 5 mins", "message": "...", "suggestions": [...], "learned": [...]}}
-
-23. SET WALLPAPER — Change desktop wallpaper:
-{{"action": "set_wallpaper", "path": "D:\\\\path\\\\image.jpg", "message": "...", "suggestions": [...], "learned": [...]}}
-
-24. WINDOW MANAGEMENT — Control windows on screen:
-{{"action": "window_manage", "operation": "minimize_all|restore_all|close_app|list_windows", "app": "chrome.exe", "message": "...", "suggestions": [...], "learned": [...]}}
-Use for: "minimize all windows", "close chrome", "what windows are open", "show me running apps"
-
-25. SET TIMER — Set a countdown timer with notification:
-{{"action": "set_timer", "seconds": 300, "label": "Break time", "message": "...", "suggestions": [...], "learned": [...]}}
-Use for: "set a timer for 5 minutes", "remind me in 30 seconds", "pomodoro timer"
-
-26. TYPE TEXT — Type text into the currently focused window:
-{{"action": "type_text", "text": "hello world", "app": "Notepad", "message": "...", "suggestions": [...], "learned": [...]}}
-Use for: "type this for me", "fill in the field with..."
-The "app" field is OPTIONAL — if provided, it will activate that window first before typing.
-IMPORTANT: When user says "open notepad and write X", use multi action:
-{{"action": "multi", "steps": [{{"action": "execute", "command": "start notepad"}}, {{"action": "type_text", "text": "X", "app": "Notepad"}}], "message": "...", "suggestions": [...], "learned": [...]}}
-
-27. HOTKEY — Press keyboard shortcuts:
-{{"action": "hotkey", "keys": "^s", "message": "...", "suggestions": [...], "learned": [...]}}
-Key codes: ^ = Ctrl, % = Alt, + = Shift. Examples: ^s = Ctrl+S, ^c = Ctrl+C, %{{F4}} = Alt+F4, ^+{{ESC}} = Ctrl+Shift+Esc
-
-28. SEARCH FILES — Search for files by name:
-{{"action": "search_files", "query": "resume", "folder": "D:\\\\Users", "message": "...", "suggestions": [...], "learned": [...]}}
-
-29. INSTALLED APPS — List all installed applications:
-{{"action": "installed_apps", "message": "...", "suggestions": [...], "learned": [...]}}
-
-NOTE ON SCREENSHOTS: User has MULTIPLE MONITORS. When taking screenshots or reading screen:
-- monitor=0 captures ALL monitors combined (default)
-- monitor=1 captures first/main display
-- monitor=2 captures second display, etc.
-If user says "screenshot of second monitor" or "read my other screen", set monitor accordingly.
-
-═══ CRITICAL RULES ═══
-- ALWAYS respond with valid JSON. Never plain text.
-- "message" — natural, friendly, short (1-2 sentences). Use user's name if known.
-- "suggestions" — ALWAYS include 2-3 smart, relevant follow-ups the user might want next. Complete sentences they can tap to execute.
-- "learned" — extract personal facts (name, job, preferences). Empty array if nothing new.
-- USE CONVERSATION HISTORY — if user says "do that again", "same thing", "that folder", refer to previous messages.
-- For emails, ALWAYS use send_email/draft_email action. NEVER use mailto or outlook.
-- Be proactive — suggest useful next steps.
-- If unsure, try the most likely approach. Don't over-ask questions.
-- YOU HAVE FULL PC ACCESS. You can create files, write code, edit code, install packages, run any command, manage git repos, open any app, browse any folder. USE IT.
-- For coding tasks: write COMPLETE, PRODUCTION-READY code. Never say "I can't code" — you CAN. Use write_file, edit_file, create_project.
-- For complex tasks, use "multi" action to chain multiple steps together.
-- You are not limited to the examples above. You can run ANY Windows command via "execute", write ANY file via "write_file", and create ENTIRE projects via "create_project".
-- When the user asks to "open" something — figure out the right command dynamically. Don't rely on hardcoded app lists.'''
+    system_prompt = build_system_prompt(profile_summary, google_connected, google_email, chat_summary)
 
     # Use conversation-aware Groq call
     memory.add('user', payload)  # ensure current message is in context
@@ -1263,11 +1431,20 @@ If user says "screenshot of second monitor" or "read my other screen", set monit
     try:
         data = json.loads(result)
     except json.JSONDecodeError:
+        log.warning(f'LLM returned non-JSON: {result[:200]}')
         memory.add('assistant', result)
         return json.dumps({
             'text': result,
             'suggestions': ['Tell me more', 'Take a screenshot', 'What else can you do?']
         })
+
+    # Log what the LLM decided to do — critical for debugging
+    action = data.get('action', 'unknown')
+    if action == 'multi':
+        step_actions = [s.get('action', '?') for s in data.get('steps', [])]
+        log.info(f'LLM action: multi → {step_actions}')
+    else:
+        log.info(f'LLM action: {action}')
 
     # Extract suggestions and learned facts before executing
     suggestions = data.get('suggestions', [])
@@ -1334,9 +1511,13 @@ def _execute_ai_action(data, google_connected):
         outputs = []
         prev_was_gui = False
         for step in data.get('steps', []):
-            # If previous step launched a GUI app, wait longer for it to load
-            if prev_was_gui and step.get('action') in ('type_text', 'hotkey'):
-                time.sleep(3)
+            # If previous step launched a GUI app, wait for it to be ready
+            if prev_was_gui:
+                if step.get('action') in ('type_text', 'hotkey'):
+                    # Wait longer and verify window is ready before typing
+                    time.sleep(5)
+                else:
+                    time.sleep(2)
             out = _execute_ai_action(step, google_connected)
             outputs.append(out)
             # Detect if this step launched a GUI app
@@ -1531,7 +1712,7 @@ def _execute_ai_action(data, google_connected):
 
     elif action == 'clipboard_set':
         text = data.get('text', '')
-        try:
+        try :
             # Use stdin to avoid shell injection
             proc = subprocess.run(['powershell', '-c', 'Set-Clipboard -Value $input'], input=text, capture_output=True, text=True, timeout=5)
             return f'✓ Copied to clipboard: {text[:100]}{"..." if len(text)>100 else ""}'
@@ -1613,22 +1794,45 @@ def _execute_ai_action(data, google_connected):
         text = data.get('text', '')
         target_app = data.get('app', '')  # optional: activate a specific window first
         try:
-            # If a target app is specified, try to bring it to foreground first
+            # If a target app is specified, wait for it and bring it to foreground
             if target_app:
-                activate_ps = f"""Add-Type -AssemblyName Microsoft.VisualBasic; $procs = Get-Process | Where-Object {{$_.MainWindowTitle -like '*{target_app}*'}}; if ($procs) {{ [Microsoft.VisualBasic.Interaction]::AppActivate($procs[0].Id); Start-Sleep -Milliseconds 500 }}"""
-                subprocess.run(['powershell', '-c', activate_ps], capture_output=True, timeout=5)
-            
-            # For long text (>100 chars), use clipboard + paste (instant)
-            if len(text) > 100:
-                escaped_text = text.replace("'", "''")
-                subprocess.run(['powershell', '-c', f"Set-Clipboard -Value '{escaped_text}'"], capture_output=True, timeout=5)
-                subprocess.run(['powershell', '-c', "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('^v')"], capture_output=True, timeout=5)
-                return f'✓ Pasted: {text[:80]}...'
-            else:
-                # For short text, use SendKeys (more reliable for special keys)
-                escaped = text.replace('{', '{{').replace('}', '}}').replace('+', '{+}').replace('^', '{^}').replace('%', '{%}').replace('~', '{~}')
-                subprocess.run(['powershell', '-c', f"Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('{escaped}')"], capture_output=True, timeout=5)
-                return f'✓ Typed: {text[:80]}'
+                # Retry up to 5 times (total ~6s) to find and activate the window
+                activated = False
+                for attempt in range(5):
+                    activate_ps = (
+                        f"Add-Type -AssemblyName Microsoft.VisualBasic; "
+                        f"$procs = Get-Process | Where-Object {{$_.MainWindowTitle -like '*{target_app}*'}}; "
+                        f"if ($procs) {{ "
+                        f"  [Microsoft.VisualBasic.Interaction]::AppActivate($procs[0].Id); "
+                        f"  Write-Output 'ACTIVATED'; "
+                        f"  Start-Sleep -Milliseconds 500 "
+                        f"}} else {{ Write-Output 'NOT_FOUND' }}"
+                    )
+                    proc = subprocess.run(['powershell', '-c', activate_ps],
+                                          capture_output=True, text=True, timeout=5)
+                    if 'ACTIVATED' in proc.stdout:
+                        activated = True
+                        log.info(f'Window "{target_app}" activated on attempt {attempt + 1}')
+                        break
+                    log.info(f'Window "{target_app}" not found, attempt {attempt + 1}/5...')
+                    time.sleep(1.5)
+
+                if not activated:
+                    log.warning(f'Could not find window "{target_app}" after 5 attempts')
+                    return f'❌ Could not find {target_app} window — it may not be open yet'
+
+            # Always use clipboard + paste — it's the most reliable method
+            # Works regardless of text length, handles special chars, and is instant
+            escaped_text = text.replace("'", "''")
+            subprocess.run(['powershell', '-c', f"Set-Clipboard -Value '{escaped_text}'"],
+                           capture_output=True, timeout=5)
+            time.sleep(0.3)
+            subprocess.run(['powershell', '-c',
+                            "Add-Type -AssemblyName System.Windows.Forms; "
+                            "[System.Windows.Forms.SendKeys]::SendWait('^v')"],
+                           capture_output=True, timeout=5)
+            display = text[:80] + '...' if len(text) > 80 else text
+            return f'✓ Typed: {display}'
         except Exception as e:
             return f'❌ Error: {e}'
 
@@ -1661,11 +1865,218 @@ def _execute_ai_action(data, google_connected):
         except Exception as e:
             return f'❌ Error: {e}'
 
+    elif action == 'web_search':
+        query = data.get('query', '')
+        if not query:
+            return 'No search query provided'
+        return handle_web_search(query)
+
+    elif action == 'web_test':
+        url = data.get('url', '')
+        instructions = data.get('instructions', '')
+        if not url:
+            return 'No URL provided for testing'
+        return handle_web_test(url, instructions)
+
+    elif action == 'system_health':
+        return handle_system_health()
+
+    elif action == 'reminder':
+        seconds = data.get('seconds', 0)
+        label = data.get('label', 'Reminder')
+        if not seconds:
+            return 'No time specified for reminder'
+        return handle_schedule_reminder(seconds, label)
+
     elif action == 'answer':
         return data.get('response', 'No response')
 
     else:
         return data.get('response', str(data))
+
+
+def handle_web_test(url, instructions=''):
+    """Run autonomous web testing on a URL using Playwright + AI."""
+    try:
+        tester = WebTestAgent(GROQ_API_KEY, GROQ_API_KEY_BACKUP)
+        report = tester.run_test(url, instructions or None)
+
+        result = {
+            'text': report.get('summary', 'Test completed but no summary generated.'),
+            'suggestions': [
+                f'Test {url} again',
+                'Test another website',
+                'Show me the bug details',
+            ],
+        }
+        if report.get('screenshot'):
+            result['screenshot'] = report['screenshot']
+
+        return json.dumps(result)
+    except ImportError:
+        return json.dumps({
+            'text': '❌ Playwright is not installed. Run: pip install playwright && python -m playwright install chromium',
+            'suggestions': ['Install playwright', 'What else can you do?'],
+        })
+    except Exception as e:
+        return json.dumps({
+            'text': f'❌ Web test failed: {e}',
+            'suggestions': ['Try again', 'Test a different site'],
+        })
+
+
+def handle_web_search(query):
+    """Search the web using DuckDuckGo instant answer API (no API key needed)."""
+    try:
+        # DuckDuckGo instant answer API
+        resp = requests.get(
+            'https://api.duckduckgo.com/',
+            params={'q': query, 'format': 'json', 'no_redirect': 1, 'no_html': 1},
+            timeout=10,
+            headers={'User-Agent': 'JARVIS-Agent/4.0'}
+        )
+        data = resp.json()
+        results = []
+
+        # Abstract (Wikipedia-style answer)
+        if data.get('Abstract'):
+            results.append(f"📖 {data['Abstract']}")
+            if data.get('AbstractURL'):
+                results.append(f"Source: {data['AbstractURL']}")
+
+        # Instant answer
+        if data.get('Answer'):
+            results.append(f"💡 {data['Answer']}")
+
+        # Related topics
+        related = data.get('RelatedTopics', [])[:5]
+        for topic in related:
+            if isinstance(topic, dict) and topic.get('Text'):
+                results.append(f"• {topic['Text'][:200]}")
+
+        if results:
+            return '\n'.join(results)
+
+        # Fallback: open in browser and tell user
+        subprocess.Popen(f'start chrome "https://www.google.com/search?q={quote_plus(query)}"',
+                         shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return f'🔍 Opened Google search for: {query}\n(No instant answer available — check your browser)'
+
+    except Exception as e:
+        # Fallback to opening browser
+        subprocess.Popen(f'start chrome "https://www.google.com/search?q={quote_plus(query)}"',
+                         shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return f'🔍 Opened Google search for: {query}'
+
+
+def handle_system_health():
+    """Collect comprehensive system health information."""
+    health = {}
+    try:
+        # CPU usage
+        proc = subprocess.run(
+            ['powershell', '-c',
+             'Get-CimInstance Win32_Processor | Select-Object -ExpandProperty LoadPercentage'],
+            capture_output=True, text=True, timeout=10)
+        health['cpu'] = f"{proc.stdout.strip()}%" if proc.stdout.strip() else 'N/A'
+    except Exception:
+        health['cpu'] = 'N/A'
+
+    try:
+        # Memory
+        proc = subprocess.run(
+            ['powershell', '-c',
+             '$os = Get-CimInstance Win32_OperatingSystem; '
+             '$used = [math]::Round(($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / 1MB, 1); '
+             '$total = [math]::Round($os.TotalVisibleMemorySize / 1MB, 1); '
+             '$pct = [math]::Round(($used / $total) * 100, 0); '
+             'Write-Output "$used/$total GB ($pct%)"'],
+            capture_output=True, text=True, timeout=10)
+        health['memory'] = proc.stdout.strip() or 'N/A'
+    except Exception:
+        health['memory'] = 'N/A'
+
+    try:
+        # Disk
+        proc = subprocess.run(
+            ['powershell', '-c',
+             'Get-PSDrive -PSProvider FileSystem | Where-Object {$_.Used -gt 0} | '
+             'ForEach-Object { $pct = [math]::Round(($_.Used / ($_.Used + $_.Free)) * 100, 0); '
+             '"$($_.Name): $([math]::Round($_.Free / 1GB, 1))GB free ($pct% used)" }'],
+            capture_output=True, text=True, timeout=10)
+        health['disk'] = proc.stdout.strip() or 'N/A'
+    except Exception:
+        health['disk'] = 'N/A'
+
+    try:
+        # Uptime
+        proc = subprocess.run(
+            ['powershell', '-c',
+             '$boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime; '
+             '$up = (Get-Date) - $boot; '
+             '"$($up.Days)d $($up.Hours)h $($up.Minutes)m"'],
+            capture_output=True, text=True, timeout=10)
+        health['uptime'] = proc.stdout.strip() or 'N/A'
+    except Exception:
+        health['uptime'] = 'N/A'
+
+    try:
+        # Battery (laptops)
+        proc = subprocess.run(
+            ['powershell', '-c',
+             '$b = Get-CimInstance Win32_Battery; '
+             'if ($b) { "$($b.EstimatedChargeRemaining)% ($($b.BatteryStatus))" } '
+             'else { "No battery (desktop)" }'],
+            capture_output=True, text=True, timeout=10)
+        health['battery'] = proc.stdout.strip() or 'N/A'
+    except Exception:
+        health['battery'] = 'N/A'
+
+    try:
+        # Top processes by memory
+        proc = subprocess.run(
+            ['powershell', '-c',
+             'Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 5 '
+             'ProcessName, @{N="MemMB";E={[math]::Round($_.WorkingSet64/1MB,0)}} | '
+             'ForEach-Object { "$($_.ProcessName): $($_.MemMB)MB" }'],
+            capture_output=True, text=True, timeout=10)
+        health['top_processes'] = proc.stdout.strip() or 'N/A'
+    except Exception:
+        health['top_processes'] = 'N/A'
+
+    lines = [
+        '🖥️ System Health Report',
+        f'  CPU:      {health["cpu"]}',
+        f'  Memory:   {health["memory"]}',
+        f'  Disk:     {health["disk"]}',
+        f'  Uptime:   {health["uptime"]}',
+        f'  Battery:  {health["battery"]}',
+        f'  Top apps: {health["top_processes"]}',
+    ]
+    return '\n'.join(lines)
+
+
+def handle_schedule_reminder(seconds, label):
+    """Schedule a reminder that shows a Windows notification after N seconds."""
+    try:
+        # Use a background PowerShell job
+        ps = (
+            f'Start-Job -ScriptBlock {{ '
+            f'Start-Sleep -Seconds {seconds}; '
+            f'[System.Reflection.Assembly]::LoadWithPartialName("System.Windows.Forms") | Out-Null; '
+            f'[System.Windows.Forms.MessageBox]::Show("{label}", "JARVIS Reminder", '
+            f'"OK", "Information") }}'
+        )
+        subprocess.run(['powershell', '-c', ps], capture_output=True, timeout=5)
+        mins = seconds // 60
+        secs = seconds % 60
+        if mins > 0:
+            time_str = f'{mins}m {secs}s' if secs else f'{mins}m'
+        else:
+            time_str = f'{secs}s'
+        return f'✓ Reminder set: "{label}" in {time_str}'
+    except Exception as e:
+        return f'❌ Error setting reminder: {e}'
 
 
 def execute_command(command):
@@ -1748,18 +2159,26 @@ def execute_command(command):
         data = json.loads(payload) if isinstance(payload, str) else (payload or {})
         output = handle_screen_action(data)
         post_result(cmd_id, output)
+    elif cmd_type == 'web_test':
+        data = json.loads(payload) if isinstance(payload, str) else (payload or {})
+        url = data.get('url', payload) if isinstance(data, dict) else payload
+        instructions = data.get('instructions', '') if isinstance(data, dict) else ''
+        output = handle_web_test(url, instructions)
+        post_result(cmd_id, output)
     else:
         post_result(cmd_id, f'Unknown command type: {cmd_type}')
 
 
 def main():
-    print(f'═══════════════════════════════════════')
-    print(f'  JARVIS Agent v3.0 (Vision Enabled)')
-    print(f'  Backend: {BACKEND_URL}')
-    print(f'  Groq AI: {"✓ Connected" if GROQ_API_KEY else "✗ No API key"}')
-    print(f'  Memory: {len(memory.messages)} messages loaded')
-    print(f'  Profile: {profile.data["total_interactions"]} total interactions')
-    print(f'═══════════════════════════════════════')
+    profile.start_session()
+    log.info('═══════════════════════════════════════')
+    log.info('  JARVIS Agent v4.0 (Enhanced)')
+    log.info(f'  Backend: {BACKEND_URL}')
+    log.info(f'  Groq AI: {"✓ Connected" if GROQ_API_KEY else "✗ No API key"}')
+    log.info(f'  Backup key: {"✓" if GROQ_API_KEY_BACKUP else "✗"}')
+    log.info(f'  Memory: {len(memory.messages)} messages + {len(memory.summaries)} summaries')
+    log.info(f'  Profile: {profile.data["total_interactions"]} interactions, {profile.data.get("session_count", 0)} sessions')
+    log.info('═══════════════════════════════════════')
 
     # Background heartbeat thread — keeps agent online during long commands
     def heartbeat_loop():
@@ -1772,26 +2191,36 @@ def main():
 
     hb_thread = threading.Thread(target=heartbeat_loop, daemon=True)
     hb_thread.start()
-    print('[heartbeat] Background heartbeat thread started')
+    log.info('Background heartbeat thread started')
 
+    consecutive_errors = 0
     while True:
         try:
             resp = requests.get(f'{BACKEND_URL}/command/pending', headers=HEADERS, timeout=5)
             command = resp.json()
+            consecutive_errors = 0  # reset on success
             if command:
                 cmd_type = command.get('type', '?')
                 payload = command.get('payload', '')
-                print(f'[cmd] {cmd_type}: {payload[:80]}{"..." if len(str(payload)) > 80 else ""}')
+                log.info(f'CMD [{cmd_type}]: {str(payload)[:80]}{"..." if len(str(payload)) > 80 else ""}')
                 try:
                     execute_command(command)
-                    print(f'[cmd] ✓ {cmd_type} completed')
+                    log.info(f'CMD [{cmd_type}] ✓ completed')
                 except Exception as e:
-                    print(f'[cmd] ✗ {cmd_type} failed: {e}')
+                    log.error(f'CMD [{cmd_type}] ✗ failed: {e}')
                     post_result(command.get('id'), f'Agent error: {e}')
         except requests.exceptions.ConnectionError:
-            print(f'[poll] Backend offline, retrying...')
+            consecutive_errors += 1
+            if consecutive_errors <= 3:
+                log.warning('Backend offline, retrying...')
+            elif consecutive_errors == 10:
+                log.error('Backend offline for extended period — still retrying')
+            # Back off on repeated failures
+            if consecutive_errors > 5:
+                time.sleep(min(consecutive_errors * 2, 30))
         except Exception as e:
-            print(f'[poll] error: {e}')
+            consecutive_errors += 1
+            log.error(f'Poll error: {e}')
 
         time.sleep(POLL_INTERVAL)
 
